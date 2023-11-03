@@ -86,8 +86,8 @@ function download_single_level_data(
     filename::AbstractString,
     variable::AbstractString;
     hours=0:23,
-    resolution=1.0,
-    bbox=[50, -130, 24, -65],
+    resolution=0.5,
+    bbox=[36.75, 258.25, 25.25, 269.75],
 )
     if isfile(filename)
         println("File $filename already exists. Skipping download.")
@@ -146,8 +146,8 @@ function download_pressure_level_data(
     variable::AbstractString,
     level::Int;
     hours=0:23,
-    resolution=1.0,
-    bbox=[50, -130, 24, -65],
+    resolution=0.5,
+    bbox=[36.75, 258.25, 25.25, 269.75],
 )
     if isfile(filename)
         println("File $filename already exists. Skipping download.")
@@ -272,7 +272,7 @@ function run_demo()
     # the path to the raw data folder
     data_dir = joinpath(HOMEDIR, "data", "raw")
 
-    years = 2019:2020 # example time range
+    years = 2021:2022 # example time range
     for year in years
 
         # Download 2m air temperature for the year 2020
