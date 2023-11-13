@@ -1,0 +1,675 @@
+---
+title: "Project_precipitation_downscaling"
+date: 2023-11-12
+author: "Zhijun Jiang (zj15)" 
+jupyter: julia-1.9
+
+number-sections: true
+code-annotations: hover
+echo: false
+
+format:
+    html: 
+        toc-depth: 3
+    docx: 
+        toc: true
+        toc-depth: 3
+        fig-format: png
+---
+
+# Overview
+Precipitation is difficult to monitor and predict, whereas data on other environmental variables are relatively easy to obtain. There might be some correlation between these variables and precipitation. In this project, the goal is to develop a precipitation downscaling model using Principal Components Analysis (PCA) and K Nearest Neighbors (KNN) based on environmental variables such as temperature, geopotensial, and cloud cover fraction. The focus region is Houston, and the data utilized is obtained from ERA5 reanalysis.
+
+# Set up
+```{julia}
+using CSV
+using DataFrames
+using DataFramesMeta
+using Dates
+using Distributions
+using DynamicHMC
+using LaTeXStrings
+using LinearAlgebra: I
+using Plots
+using NCDatasets
+using MultivariateStats
+using Unitful
+using StatsBase
+using StatsPlots
+using Turing
+```
+
+# Read data
+ERA5 reanalysis data for temperature, pressure, and cloud cover fraction were collected for the Houston region. The data spanned a specific time period from 1979 to 2022, where longitude ranges from 258.25 to 269.25 and latitude from 25.25 to 36.25. Precipitation is obtained from NEXRAD radar precipitation data. For this project, I used the same precipitation data from lab 6.
+One thing to note is that the latitude data is flipped, so we need to rearrange it in the proper order. We also need to repeat this process for the other variables. 
+```{julia}
+# read precipitation data
+precip_ds = NCDataset("data/precip_tx.nc") #1979 to 2023
+precip_time = precip_ds["time"][:] #16365-element
+precip_lon = precip_ds["lon"][:] #24-element
+precip_lat = precip_ds["lat"][:] #24-element
+precip_lat = reverse(precip_lat)
+precip = precip_ds["precip"][:, :, :] .* 1.0u"mm" #24*24*16365
+precip = reverse(precip; dims=2)
+```
+
+```{julia}
+# read temperature data
+#1. get longitude and latitude information
+temp_ds = NCDataset("data/raw/2m_temperature_1979.nc")
+temp_lon = temp_ds["longitude"][:] #12-element
+temp_lat = temp_ds["latitude"][:] #12-element
+temp_lat = reverse(temp_lat) #reverse the latitude data
+
+#2. get temperature data from year 1979 to 2022
+temp = []
+temp_time = []
+for i in 1979:2022 #1979 to 2022
+    temp_i_ds = NCDataset("data/raw/2m_temperature_$i.nc")
+    temp_i_time = temp_i_ds["time"][:]
+    temp_i = temp_i_ds["t2m"][:, :, :] .* 1.0u"K"
+    if i == 1979
+        temp_time = temp_i_time
+        temp = temp_i
+    else
+        temp_time = vcat(temp_time, temp_i_time)
+        temp = cat(temp, temp_i, dims=3)
+    end
+end
+temp = reverse(temp; dims=2)
+```
+
+```{julia}
+# read geopotensial data
+#1. get longitude and latitude data 
+geopotential_i_ds = NCDataset("data/raw/500hPa_geopotential_1979.nc")
+geopotential_lon = geopotential_i_ds["longitude"][:] #12-element
+geopotential_lat = geopotential_i_ds["latitude"][:] #12-element
+geopotential_lat = reverse(geopotential_lat)
+#2. get pressure data from year 1979 to 2022
+geopotential = []
+geopotential_time = []
+for i in 1979:2022 #1979 to 2022
+    geopotential_i_ds = NCDataset("data/raw/500hPa_geopotential_$i.nc")
+    geopotential_i_time = geopotential_i_ds["time"][:]
+    geopotential_i = geopotential_i_ds["z"][:, :, :]
+    if i == 1979
+        geopotential_time = geopotential_i_time
+        geopotential = geopotential_i
+    else
+        geopotential_time = vcat(geopotential_time, geopotential_i_time)
+        geopotential = cat(geopotential, geopotential_i, dims=3)
+    end
+end
+geopotential = reverse(geopotential; dims=2)
+```
+
+```{julia}
+# read cloud cover fraction data
+#1. get longitude and latitude information
+cc_i_ds = NCDataset("data/raw_1/500hPa_cloud_cover_1979.nc")
+cc_lon = cc_i_ds["longitude"][:] #12-element
+cc_lat = cc_i_ds["latitude"][:] #12-element
+cc_lat = reverse(cc_lat) #reverse the latitude data
+#2. get cloud cover data from year 1979 to 2022
+cc = []
+cc_time = []
+for i in 1979:2022 #1979 to 2022
+    cc_i_ds = NCDataset("data/raw_1/500hPa_cloud_cover_$i.nc")
+    cc_i_time = cc_i_ds["time"][:]
+    cc_i = cc_i_ds["cc"][:, :, :]
+    if i == 1979
+        cc_time = cc_i_time
+        cc = cc_i
+    else
+        cc_time = vcat(cc_time, cc_i_time)
+        cc = cat(cc, cc_i, dims=3)
+    end
+end
+cc = reverse(cc; dims=2)
+```
+
+# Plot heatmap for a single day
+In this section, I wanted to get a general idea of the correlation between these variables and precipitation, so I picked a random day and plotted a heat map for each variable separately.
+I found temperature and geopotential to be very consistent, but they don't seem to have much to do with precipitation. However, cloud cover seems to have some relationship with rainfall, which makes sense because generally speaking, the more clouds in the sky, the greater the likelihood of rain.
+```{julia}
+time = temp_time
+time_sample = rand(1:size(time)[1])
+#temperature data for a single day
+P_temp = heatmap(
+    temp_lon, # x labels
+    temp_lat, # y labels
+    temp[:, :, time_sample]';
+    size=(600, 700),
+    title="Temperature on $(temp_time[time_sample])",
+    xlabel="Longitude",
+    ylabel="Latitude"
+)
+
+#pressure data for a single day
+P_geopotential = heatmap(
+    geopotential_lon, # x labels
+    geopotential_lat, # y labels
+    geopotential[:, :, time_sample]';
+    size=(600, 700),
+    title="Geopotential on $(geopotential_time[time_sample])",
+    xlabel="Longitude",
+    ylabel="Latitude"
+)
+
+#cloud cover data for a single day
+P_cloud_cover = heatmap(
+    cc_lon, # x labels
+    cc_lat, # y labels
+    cc[:, :, time_sample]';
+    size=(600, 700),
+    title="Cloud cover on $(cc_time[time_sample])",
+    xlabel="Longitude",
+    ylabel="Latitude"
+)
+
+#precipitation data for a single day
+P_precip = heatmap(
+    precip_lon, # x labels
+    precip_lat, # y labels
+    precip[:, :, time_sample]';
+    size=(600, 700),
+    title="Precipitation on $(precip_time[time_sample])",
+    xlabel="Longitude",
+    ylabel="Latitude"
+)
+
+plot!(P_temp, P_geopotential, P_cloud_cover, P_precip; layout=(2, 2), size=(1500, 1100))
+```
+
+
+# Split the data
+This downscaling model was trained on the training set and validated on the testing set. I splited the training set and the testing set based on the timeline. The data from last five years was catagoried into testing set while the rest of the data served as training set.
+```{julia}
+#split the data
+#last 5 years data as the testing data and the rest as training data
+idx_partition = findfirst(time .== time[end] - Dates.Year(5))
+train_idx = 1:idx_partition
+test_idx = (idx_partition+1):length(time)
+time_train = time[1:idx_partition]
+time_test = time[idx_partition+1:length(time)]
+
+precip_train = precip[:, :, train_idx]
+precip_test = precip[:, :, test_idx]
+
+temp_train = temp[:, :, train_idx]
+temp_test = temp[:, :, test_idx]
+
+geopotential_train = geopotential[:, :, train_idx]
+geopotential_test = geopotential[:, :, test_idx]
+
+cloud_cover_train = cc[:, :, train_idx]
+cloud_cover_test = cc[:, :, test_idx]
+```
+
+# Preprocess
+The purpose of preprocessing the data is to obtain variance data and reshape these variance data arrays into matrix for the next step.
+```{julia}
+function preprocess(temp::Array{T,3}, temp_ref::Array{T,3})::AbstractMatrix where {T}
+    n_lon, n_lat, n_t = size(temp)
+    climatology = mean(temp_ref; dims=3)
+    temp_anom = temp .- climatology
+    temp_anom = reshape(temp_anom, n_lon * n_lat, n_t)
+    return ustrip.(temp_anom)
+end
+
+temp_mat_train = preprocess(temp_train, temp_train)
+temp_mat_test = preprocess(temp_test, temp_test)
+
+geopotential_mat_train = preprocess(geopotential_train, geopotential_train)
+geopotential_mat_test = preprocess(geopotential_test, geopotential_test)
+
+cloud_cover_mat_train = preprocess(cloud_cover_train, cloud_cover_train)
+cloud_cover_mat_test = preprocess(cloud_cover_test, cloud_cover_test)
+```
+
+
+# Principal components analysis
+PCA was employed in this model to reduce the dimensionality of the input data while preserving essential information. This method is beneficial for capturing dominant patterns in the variables. The number of principal components selected was determined through analysis of the explained variance. 
+Here I plotted the explained variance and cumulative explained variance for all three variables. From these plots we can see that for the temperature and geopotential data we can get most of the information by choosing only two principal components, but for the cloud cover data, two principal components are not enough.
+```{julia}
+#fitting
+pca_model_temp = fit(PCA, temp_mat_train; maxoutdim=25, pratio=0.999)
+pca_model_geopotential = fit(PCA, geopotential_mat_train; maxoutdim=25, pratio=0.999)
+pca_model_cloud_cover = fit(PCA, cloud_cover_mat_train; maxoutdim=25, pratio=0.999)
+#plot variance
+p1_temp = plot(
+    principalvars(pca_model_temp) / var(pca_model_temp);
+    xlabel="number of PCs",
+    ylabel="Fraction of Variance Explained",
+    label=false,
+    title="Variance Explained - Temperature"
+)
+p2_temp = plot(
+    cumsum(principalvars(pca_model_temp)) / var(pca_model_temp);
+    xlabel="number of PCs",
+    ylabel="Fraction of Variance Explained",
+    label=false,
+    title="Cumulative Variance Explained - Temperature"
+)
+p1_geopotential = plot(
+    principalvars(pca_model_geopotential) / var(pca_model_geopotential);
+    xlabel="number of PCs",
+    ylabel="Fraction of Variance Explained",
+    label=false,
+    title="Variance Explained - Geopotential"
+)
+p2_geopotential = plot(
+    cumsum(principalvars(pca_model_geopotential)) / var(pca_model_geopotential);
+    xlabel="number of PCs",
+    ylabel="Fraction of Variance Explained",
+    label=false,
+    title="Cumulative Variance Explained - Geopotential"
+)
+p1_cloud_cover = plot(
+    principalvars(pca_model_cloud_cover) / var(pca_model_cloud_cover);
+    xlabel="number of PCs",
+    ylabel="Fraction of Variance Explained",
+    label=false,
+    title="Variance Explained - Cloud cover"
+)
+p2_cloud_cover = plot(
+    cumsum(principalvars(pca_model_cloud_cover)) / var(pca_model_cloud_cover);
+    xlabel="number of PCs",
+    ylabel="Fraction of Variance Explained",
+    label=false,
+    title="Cumulative Variance Explained - Cloud cover"
+)
+
+plot(p1_temp, p2_temp, p1_geopotential, p2_geopotential, p1_cloud_cover, p2_cloud_cover; layout=(3, 2), size=(1500, 1500))
+#For temperature and geopotential data, selecting two principle components should be enough but for the cloud cover data, if we just choose two PCs, we are actually losing a lot of information.
+```
+
+We can also plot the projection of these PCs on the latitude and longitude axes. 
+```{julia}
+#plot of projection
+p_temp_projection = []
+n_lon, n_lat, n_t = size(temp)
+for i in 1:3
+    pc = projection(pca_model_temp)[:, i]
+    pc = reshape(pc, n_lat, n_lon)'
+    pi = heatmap(
+        temp_lon,
+        temp_lat,
+        pc;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="PC $i - Temperature",
+        aspect_ratio=:equal,
+        cmap=:PuOr
+    )
+    push!(p_temp_projection, pi)
+end
+
+p_geopotential_projection = []
+n_lon, n_lat, n_t = size(geopotential)
+for i in 1:3
+    pc = projection(pca_model_geopotential)[:, i]
+    pc = reshape(pc, n_lat, n_lon)'
+    pi = heatmap(
+        geopotential_lon,
+        geopotential_lat,
+        pc;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="PC $i - Geopotential",
+        aspect_ratio=:equal,
+        cmap=:PuOr
+    )
+    push!(p_geopotential_projection, pi)
+end
+
+p_cloud_cover_projection = []
+n_lon, n_lat, n_t = size(cc)
+for i in 1:3
+    pc = projection(pca_model_cloud_cover)[:, i]
+    pc = reshape(pc, n_lat, n_lon)'
+    pi = heatmap(
+        cc_lon,
+        cc_lat,
+        pc;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="PC $i - Cloud cover",
+        aspect_ratio=:equal,
+        cmap=:PuOr
+    )
+    push!(p_cloud_cover_projection, pi)
+end
+
+plot(p_temp_projection..., p_geopotential_projection..., p_cloud_cover_projection...; layout=(3, 3), size=(1500, 1000))
+```
+
+For this part, I plotted the time series of the first two PCs. The results are consistent with my speculation above. Based on these graphs, I hypothesize that PC 1 varies seasonally, while PC 2 and PC 3 are more closely related to daily variations. In addition, the PCs of temperature and geopotential data have very similar patterns which means they are closely related.
+```{julia}
+pc_ts_temp = predict(pca_model_temp, temp_mat_train)
+day_of_year = Dates.dayofyear.(time_train)
+p_temp_PC = []
+for i in 1:3
+    pi = scatter(
+        day_of_year,
+        pc_ts_temp[i, :];
+        xlabel="Day of Year",
+        ylabel="PC $i",
+        title="PC $i - Temperature",
+        label=false,
+        alpha=0.3,
+        color=:gray
+    )
+    push!(p_temp_PC, pi)
+end
+
+pc_ts_geopotential = predict(pca_model_geopotential, geopotential_mat_train)
+p_geopotential_PC = []
+for i in 1:3
+    pi = scatter(
+        day_of_year,
+        pc_ts_geopotential[i, :];
+        xlabel="Day of Year",
+        ylabel="PC $i",
+        title="PC $i - Geopotential",
+        label=false,
+        alpha=0.3,
+        color=:gray
+    )
+    push!(p_geopotential_PC, pi)
+end
+
+pc_ts_cloud_cover = predict(pca_model_cloud_cover, cloud_cover_mat_train)
+p_cloud_cover_PC = []
+for i in 1:3
+    pi = scatter(
+        day_of_year,
+        pc_ts_cloud_cover[i, :];
+        xlabel="Day of Year",
+        ylabel="PC $i",
+        title="PC $i - Cloud cover",
+        label=false,
+        alpha=0.3,
+        color=:gray
+    )
+    push!(p_cloud_cover_PC, pi)
+end
+
+plot(p_temp_PC..., p_geopotential_PC..., p_cloud_cover_PC...; layout=(3, 3), size=(1500, 1500))
+#There seem to be some seasonal patterns
+```
+
+These are scatter plots of rainfall for each variables. We have assumed that rainy days have precipitation values above the 98th percentile.
+```{julia}
+#rainfall scatter plot
+avg_precip =
+    ustrip.(
+        u"mm", [mean(skipmissing(precip_train[:, :, t])) for t in 1:size(precip_train, 3)]
+    )
+avg_precip = replace(avg_precip, NaN => 0)
+p2_idx = findall(avg_precip .> quantile(avg_precip, 0.98))
+p1_rainfall_temp = scatter(
+    pc_ts_temp[2, :],
+    pc_ts_temp[3, :];
+    zcolor=avg_precip,
+    xlabel="PC 2 - Temperature",
+    ylabel="PC 3 - Temperature",
+    markersize=3,
+    clims=(0, maximum(avg_precip[p2_idx])),
+    title="All Days",
+    label=false
+)
+
+p2_rainfall_temp = scatter(
+    pc_ts_temp[2, p2_idx],
+    pc_ts_temp[3, p2_idx];
+    zcolor=avg_precip[p2_idx],
+    xlabel="PC 2 - Temperature",
+    ylabel="PC 3 - Temperature",
+    markersize=5,
+    clims=(0, maximum(avg_precip[p2_idx])),
+    title="Rainy Days",
+    label=false
+)
+
+p1_rainfall_geopotential = scatter(
+    pc_ts_geopotential[2, :],
+    pc_ts_geopotential[3, :];
+    zcolor=avg_precip,
+    xlabel="PC 2 - Geopotential",
+    ylabel="PC 3 - Geopotential",
+    markersize=3,
+    clims=(0, maximum(avg_precip[p2_idx])),
+    title="All Days",
+    label=false
+)
+
+p2_rainfall_geopotential = scatter(
+    pc_ts_geopotential[2, p2_idx],
+    pc_ts_geopotential[3, p2_idx];
+    zcolor=avg_precip[p2_idx],
+    xlabel="PC 2 - Geopotential",
+    ylabel="PC 3 - Geopotential",
+    markersize=5,
+    clims=(0, maximum(avg_precip[p2_idx])),
+    title="Rainy Days",
+    label=false
+)
+
+p1_rainfall_cloud_cover = scatter(
+    pc_ts_cloud_cover[2, :],
+    pc_ts_cloud_cover[3, :];
+    zcolor=avg_precip,
+    xlabel="PC 2 - Cloud cover",
+    ylabel="PC 3 - Cloud cover",
+    markersize=3,
+    clims=(0, maximum(avg_precip[p2_idx])),
+    title="All Days",
+    label=false
+)
+
+p2_rainfall_cloud_cover = scatter(
+    pc_ts_cloud_cover[2, p2_idx],
+    pc_ts_cloud_cover[3, p2_idx];
+    zcolor=avg_precip[p2_idx],
+    xlabel="PC 2 - Cloud cover",
+    ylabel="PC 3 - Cloud cover",
+    markersize=5,
+    clims=(0, maximum(avg_precip[p2_idx])),
+    title="Rainy Days",
+    label=false
+)
+plot(p1_rainfall_temp, p2_rainfall_temp, p1_rainfall_geopotential, p2_rainfall_geopotential, p1_rainfall_cloud_cover, p2_rainfall_cloud_cover; layout=(3, 2), size=(1500, 1500))
+```
+
+# K nearest neighbors
+Here we created a function of the KNN algorithm. The KNN algorithm was trained on the PCA-transformed data, associating each point with its high-resolution precipitation value. K is the hyperparameter of the algorithm, which we set to a number before running the function. We use Euclidean distance as the distance metric. We select the K data points that are closest to the point we want to predict, and the data point with the smallest distance has the highest weight.
+```{julia}
+function euclidean_distance(x::AbstractVector, y::AbstractVector)::AbstractFloat
+    return sqrt(sum((x .- y) .^ 2))
+end
+function nsmallest(x::AbstractVector, n::Int)::Vector{Int}
+    idx = sortperm(x)
+    return idx[1:n]
+end
+function knn(X::AbstractMatrix, X_i::AbstractVector, K::Int)::Tuple{Int,AbstractVector}
+    # calculate the distances between X_i and each row of X
+    dist = [euclidean_distance(X_i, X[j, :]) for j in 1:size(X, 1)]
+    idx = nsmallest(dist, K)
+    w = 1 ./ dist[idx]
+    w ./= sum(w)
+    idx_sample = sample(idx, Weights(w))
+    return (idx_sample, vec(X[idx_sample, :]))
+end
+```
+
+And then we combine PCA and KNN together
+```{julia}
+#pca and knn
+function predict_knn(temp_train, temp_test, precip_train; n_pca::Int)
+    X_train = preprocess(temp_train, temp_train)
+    X_test = preprocess(temp_test, temp_train)
+    # fit the PCA model to the training data
+    pca_model_temp = fit(PCA, X_train; maxoutdim=n_pca)
+    # project the test data onto the PCA basis
+    train_embedded = predict(pca_model_temp, X_train)
+    test_embedded = predict(pca_model_temp, X_test)
+    # use the `knn` function for each point in the test data
+    precip_pred = map(1:size(X_test, 2)) do i
+        idx, _ = knn(train_embedded', test_embedded[:, i], 3)
+        precip_train[:, :, idx]
+    end
+    # return a matrix of predictions
+    return precip_pred
+end
+```
+
+
+# Prediction results
+Now we can feed the data into the model we just built and plot heat maps of the predicted results and the actual rainfall data. What I have done here is to randomly select three days from the test set and compare the rainfall predictions with the actual rainfall data. I found that the rainfall predictions based on temperature and potential data were not as good as expected. However, the predictions based on cloud cover were sometimes closer to the actual rainfall.
+```{julia}
+#precipitation prediction based on the temperature
+t_sample = rand(1:size(temp_test, 3), 3)
+Time_collected = time_test[t_sample]
+precip_pred_temp = predict_knn(temp_train, temp_test[:, :, t_sample], precip_train; n_pca=3)
+p_rainfall_precit_temp = map(eachindex(t_sample)) do ti
+    t = t_sample[ti]
+    y_pred = precip_pred_temp[ti]'
+    y_actual = precip_test[:, :, t]'
+    cmax = max(maximum(skipmissing(y_pred)), maximum(skipmissing(y_actual)))
+    cmax = ustrip(u"mm", cmax)
+    p1 = heatmap(
+        precip_lon,
+        precip_lat,
+        y_pred;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Prediction on $(Time_collected[ti]) - Temperature",
+        aspect_ratio=:equal,
+        clims=(0, cmax)
+    )
+    plot(p1; size=(1000, 400))
+end
+
+#precipitation prediction based on the geopotential
+precip_pred_geopotential = predict_knn(geopotential_train, geopotential_test[:, :, t_sample], precip_train; n_pca=3)
+p_rainfall_precit_geopotential = map(eachindex(t_sample)) do ti
+    t = t_sample[ti]
+    y_pred = precip_pred_geopotential[ti]'
+    y_actual = precip_test[:, :, t]'
+    cmax = max(maximum(skipmissing(y_pred)), maximum(skipmissing(y_actual)))
+    cmax = ustrip(u"mm", cmax)
+    p1 = heatmap(
+        precip_lon,
+        precip_lat,
+        y_pred;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Prediction on $(Time_collected[ti]) - Geopotential",
+        aspect_ratio=:equal,
+        clims=(0, cmax)
+    )
+    plot(p1; size=(1000, 400))
+end
+
+#precipitation prediction based on the cloud cover
+precip_pred_cloud_cover = predict_knn(cloud_cover_train, cloud_cover_test[:, :, t_sample], precip_train; n_pca=3)
+p_rainfall_precit_cloud_cover = map(eachindex(t_sample)) do ti
+    t = t_sample[ti]
+    y_pred = precip_pred_cloud_cover[ti]'
+    y_actual = precip_test[:, :, t]'
+    cmax = max(maximum(skipmissing(y_pred)), maximum(skipmissing(y_actual)))
+    cmax = ustrip(u"mm", cmax)
+    p1 = heatmap(
+        precip_lon,
+        precip_lat,
+        y_pred;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Prediction on $(Time_collected[ti]) - Cloud cover",
+        aspect_ratio=:equal,
+        clims=(0, cmax)
+    )
+    plot(p1; size=(1000, 400))
+end
+
+#actual rainfall 
+p_rainfall_actual = map(eachindex(t_sample)) do ti
+    t = t_sample[ti]
+    y_actual = precip_test[:, :, t]'
+    cmax = maximum(skipmissing(y_actual))
+    cmax = ustrip(u"mm", cmax)
+    p1 = heatmap(
+        precip_lon,
+        precip_lat,
+        y_actual;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Actual rainfall on $(Time_collected[ti])",
+        aspect_ratio=:equal,
+        clims=(0, cmax)
+    )
+    plot(p1; size=(1000, 400))
+end
+plot(p_rainfall_precit_temp..., p_rainfall_precit_geopotential..., p_rainfall_precit_cloud_cover..., p_rainfall_actual...; layout=(4, 3), size=(1500, 1000))
+```
+
+# Linear Regression
+```{julia}
+avg_precipitation = []
+avg_cloud_cover = []
+for t in 1:size(precip_train, 3)
+    avg_precip_t =
+        ustrip.(
+            u"mm", [mean(skipmissing(precip_train[:, :, t]))]
+        )
+
+    avg_cloud_cover_t = mean(skipmissing(cloud_cover_train[:, :, t]))
+    push!(avg_precipitation, avg_precip_t)
+    push!(avg_cloud_cover, avg_cloud_cover_t)
+end
+avg_precipitation = replace(avg_precipitation, NaN => 0)
+avg_cloud_cover = replace(avg_cloud_cover, NaN => 0)
+```
+
+```{julia}
+@model function linear_reg(X::AbstractVector, y::AbstractVector)
+    α ~ Normal(0, 10) # the intercept
+    β ~ Normal(0, 10) # the slope
+    σ ~ truncated(Normal(0, 10), 0, Inf) # the standard deviation
+    μ = α .+ β * X
+    return y .~ Normal.(μ, σ)
+end
+```
+
+```{julia}
+X = avg_cloud_cover
+y = avg_precipitation
+ppc_linear = let
+    model = linear_reg(X, y) # call the model
+    sampler = Prior() # we want to sample from the prior
+    nsamples = 10_000
+    sample(model, sampler, nsamples; drop_warmup=true)
+end
+```
+
+```{julia}
+plot(ppc_linear)
+```
+
+```{julia}
+for idx in 1:500
+    α = ppc_linear[:α][idx]
+    β = ppc_linear[:β][idx]
+    σ = ppc_linear[:σ][idx]
+    return α, β, σ
+end
+```
+
+    rt = quantile.(LogNormal(μ, σ), aeps)
+    label = idx == 1 ? "Posterior" : false
+    plot!(plt_rt, rts, rt; color=:black, alpha=0.05, label=label, linewidth=0.5)
+end
+plt_rt
+```

@@ -85,9 +85,9 @@ function download_single_level_data(
     year::Int,
     filename::AbstractString,
     variable::AbstractString;
-    hours=0:23,
-    resolution=0.5,
-    bbox=[36.75, 258.25, 25.25, 269.75],
+    hours=0:0,
+    resolution=1.0,
+    bbox=[36.75, 258.25, 25.25, 269.75]
 )
     if isfile(filename)
         println("File $filename already exists. Skipping download.")
@@ -145,9 +145,9 @@ function download_pressure_level_data(
     filename::AbstractString,
     variable::AbstractString,
     level::Int;
-    hours=0:23,
-    resolution=0.5,
-    bbox=[36.75, 258.25, 25.25, 269.75],
+    hours=0:0,
+    resolution=1.0,
+    bbox=[36.75, 258.25, 25.25, 269.75]
 )
     if isfile(filename)
         println("File $filename already exists. Skipping download.")
@@ -270,36 +270,36 @@ end
 function run_demo()
 
     # the path to the raw data folder
-    data_dir = joinpath(HOMEDIR, "data", "raw")
+    data_dir = joinpath(HOMEDIR, "data", "raw_1")
 
-    years = 2021:2022 # example time range
+    years = 1979:2023 # example time range
     for year in years
 
         # Download 2m air temperature for the year 2020
         download_single_level_data.(
-            year, joinpath(data_dir, "2m_temperature_$year.nc"), "2m_temperature"
+            year, joinpath(data_dir, "d2m_temperature_$year.nc"), "2m_dewpoint_temperature"
         )
 
         # Download 500 hPa geopotential for the year 2020
         level = 500
         download_pressure_level_data.(
             year,
-            joinpath(data_dir, "$(level)hPa_geopotential_$year.nc"),
-            "geopotential",
+            joinpath(data_dir, "$(level)hPa_cloud_cover_$year.nc"),
+            "fraction_of_cloud_cover",
             level,
         )
     end
 
     # read in all the 2m temperature data
-    fnames = shuffle(glob("2m_temperature", data_dir)) # shuffle -- should work even if out of order
-    t2m = open_mfdataset(fnames, "t2m") # we sort based on time, so we don't need to sort here
+    fnames = shuffle(glob("d2m_temperature", data_dir)) # shuffle -- should work even if out of order
+    d2m = open_mfdataset(fnames, "d2m") # we sort based on time, so we don't need to sort here
 
     # read in all the 500 hPa geopotential data
-    fnames = shuffle(glob("500hPa_geopotential", data_dir))
-    z500 = open_mfdataset(fnames, "z")
+    fnames = shuffle(glob("cloud_cover", data_dir))
+    cc = open_mfdataset(fnames, "cc")
 
-    display(t2m)
-    display(z500)
+    display(d2m)
+    display(cc)
 
     return nothing
 end
